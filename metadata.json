@@ -1,0 +1,6 @@
+{
+  "name": "Vatutin Store",
+  "description": "Покупка и продажа цифровых игровых товаров в Telegram.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
