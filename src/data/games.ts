@@ -25,6 +25,9 @@ export interface GameConfig {
 export const SUPPORT_URL = 'https://t.me/PayRadiseSupport';
 export const SELL_MANAGER_URL = 'https://t.me/PayRadise';
 
+// Games that deliver gold via the in-game market (skin listing) instead of trade/bank.
+export const MARKET_DELIVERY_GAME_KEYS: string[] = ['so2'];
+
 export const PROMO_CODES: Record<string, number> = {
   START5: 5,
   BONUS7: 7,

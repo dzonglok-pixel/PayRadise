@@ -8,6 +8,7 @@ import {
   GAMES,
   SUPPORT_URL,
   PROMO_CODES,
+  MARKET_DELIVERY_GAME_KEYS,
   GameConfig,
 } from './data/games.ts';
 import {
@@ -29,6 +30,13 @@ import {
 } from './utils/auth.ts';
 import { db, ReviewItem } from './utils/supabase.ts';
 import { formatReviewDate } from './utils/formatDate.ts';
+import {
+  loadLocalReviews,
+  addLocalReview,
+  removeLocalReview,
+  sortReviews,
+  mergeReviews,
+} from './utils/reviews.ts';
 
 declare global {
   interface Window {
@@ -77,7 +85,7 @@ export default function App() {
 
   // Buy form state
   const [nickname, setNickname] = useState<string>(() => getCurrentSession() || '');
-  const [deliveryMethod, setDeliveryMethod] = useState<'trade' | 'bank'>('trade');
+  const [deliveryMethod, setDeliveryMethod] = useState<'trade' | 'bank' | 'market'>('trade');
   const [bankAccount, setBankAccount] = useState<string>('');
   const [promoCode, setPromoCode] = useState<string>('');
   const [virtualAmountStr, setVirtualAmountStr] = useState<string>('');
@@ -126,6 +134,7 @@ export default function App() {
 
     if (gameParam && GAMES[gameParam]) {
       setSelectedGameKey(gameParam);
+      setDeliveryMethod(MARKET_DELIVERY_GAME_KEYS.includes(gameParam) ? 'market' : 'trade');
     }
     if (screenParam) {
       setActiveScreen(screenParam);
@@ -163,7 +172,7 @@ export default function App() {
     setPromoCode('');
     setVirtualAmountStr('');
     setMoneyAmountStr('');
-    setDeliveryMethod('trade');
+    setDeliveryMethod(MARKET_DELIVERY_GAME_KEYS.includes(key) ? 'market' : 'trade');
     setLastEdited('virtual');
     setServerSearch('');
     setActiveScreen('actions');
@@ -373,10 +382,13 @@ export default function App() {
     },
   ], []);
 
-  // Supabase: Загрузка отзывов (db.from('reviews').select('*').order('created_at', { ascending: false }))
+  // Загрузка отзывов: локальные отзывы (гарантированно) + Supabase (по возможности).
   const loadReviews = async () => {
     setReviewsLoading(true);
     setReviewsError(null);
+
+    const localReviews = loadLocalReviews();
+
     try {
       const { data, error } = await db
         .from('reviews')
@@ -386,16 +398,15 @@ export default function App() {
       if (error) {
         console.warn('Supabase fetch error:', error);
         setReviewsError(error.message);
-        setReviews((prev) => (prev.length > 0 ? prev : DEFAULT_REVIEWS));
-      } else if (data && data.length > 0) {
-        setReviews(data);
-      } else {
-        setReviews(DEFAULT_REVIEWS);
       }
+
+      const remoteReviews: ReviewItem[] = !error && Array.isArray(data) ? (data as ReviewItem[]) : [];
+      const merged = mergeReviews(localReviews, remoteReviews);
+      setReviews(merged.length > 0 ? merged : DEFAULT_REVIEWS);
     } catch (err: any) {
       console.warn('Supabase network error:', err);
       setReviewsError(err.message || 'Ошибка подключения к базе');
-      setReviews((prev) => (prev.length > 0 ? prev : DEFAULT_REVIEWS));
+      setReviews(localReviews.length > 0 ? localReviews : DEFAULT_REVIEWS);
     } finally {
       setReviewsLoading(false);
     }
@@ -405,7 +416,7 @@ export default function App() {
     loadReviews();
   }, []);
 
-  // Supabase: Сохранение отзыва (db.from('reviews').insert([...]))
+  // Сохранение отзыва: всегда пишем локально (гарантированно), затем пытаемся синхронизировать с Supabase.
   const handleAddReview = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!currentUser) {
@@ -425,46 +436,54 @@ export default function App() {
     setReviewFormError(null);
     setReviewFormSuccess(null);
 
+    const cleanAmount = reviewAmount.replace(/\s+/g, '');
+    const amountValue = cleanAmount ? cleanAmount : reviewAmount.trim();
+    const payload = {
+      nickname: currentUser,
+      rating: reviewRating,
+      game_name: reviewGame,
+      amount: amountValue,
+      review_text: reviewText.trim(),
+    };
+
+    // 1) Guaranteed local persistence, then update the UI right away.
+    const savedReview = addLocalReview(payload);
+    setReviews((prev) => sortReviews([savedReview, ...prev]));
+
+    // 2) Best-effort cloud sync (non-blocking for the user).
     try {
-      const cleanAmount = reviewAmount.replace(/\s+/g, '');
-      const newReview = {
-        nickname: currentUser,
-        rating: reviewRating,
-        game_name: reviewGame,
-        amount: isNaN(Number(cleanAmount)) ? reviewAmount.trim() : Number(cleanAmount),
-        review_text: reviewText.trim(),
-      };
-
-      const { data, error } = await db.from('reviews').insert([newReview]).select();
-
+      const { error } = await db.from('reviews').insert([payload]);
       if (error) {
-        setReviewFormError('Не удалось сохранить в Supabase: ' + error.message);
-      } else {
-        setReviewFormSuccess('Отзыв успешно опубликован!');
-        setReviewText('');
-        setReviewAmount('');
-        setShowReviewForm(false);
-        await loadReviews();
+        console.warn('Supabase insert error (review saved locally):', error);
       }
     } catch (err: any) {
-      setReviewFormError('Ошибка при сохранении: ' + (err.message || 'Неизвестная ошибка'));
-    } finally {
-      setReviewSubmitting(false);
+      console.warn('Supabase insert network error (review saved locally):', err);
     }
+
+    setReviewFormSuccess('Отзыв успешно опубликован!');
+    setReviewText('');
+    setReviewAmount('');
+    setShowReviewForm(false);
+    setReviewSubmitting(false);
   };
 
-  // Supabase: Удаление отзыва в админке (db.from('reviews').delete().eq('id', reviewId))
+  // Удаление отзыва: сначала удаляем из локального хранилища, затем по возможности из Supabase.
   const handleDeleteReview = async (reviewId: string | number) => {
     if (!confirm('Вы уверены, что хотите удалить этот отзыв?')) return;
-    try {
-      const { error } = await db.from('reviews').delete().eq('id', reviewId);
-      if (error) {
-        alert('Ошибка при удалении из Supabase: ' + error.message);
-      } else {
-        setReviews((prev) => prev.filter((r) => r.id !== reviewId));
+
+    removeLocalReview(reviewId);
+    setReviews((prev) => prev.filter((r) => r.id !== reviewId));
+
+    const isLocalId = typeof reviewId === 'string' && reviewId.startsWith('local_');
+    if (!isLocalId) {
+      try {
+        const { error } = await db.from('reviews').delete().eq('id', reviewId);
+        if (error) {
+          console.warn('Supabase delete error:', error);
+        }
+      } catch (err: any) {
+        console.warn('Supabase delete network error:', err);
       }
-    } catch (err: any) {
-      alert('Ошибка при удалении: ' + err.message);
     }
   };
 
@@ -475,7 +494,9 @@ export default function App() {
     return currentGame.servers.filter((s) => s.toLowerCase().includes(query));
   }, [currentGame.servers, serverSearch]);
 
-  const deliveryMethodLabel = deliveryMethod === 'bank' ? 'Банком' : 'Трейдом';
+  const isMarketDelivery = MARKET_DELIVERY_GAME_KEYS.includes(currentGame.key);
+  const deliveryMethodLabel =
+    deliveryMethod === 'market' ? 'Через рынок' : deliveryMethod === 'bank' ? 'Банком' : 'Трейдом';
 
   // Render discounts block
   const renderDiscounts = () => {
@@ -880,45 +901,60 @@ export default function App() {
 
             <div className="delivery-box">
               <div className="section-title">Способ получения</div>
-              <div className="delivery-toggle">
-                <button
-                  type="button"
-                  id="deliveryTradeBtn"
-                  className={`delivery-option ${deliveryMethod === 'trade' ? 'active' : ''}`}
-                  onClick={() => {
-                    setDeliveryMethod('trade');
-                    setBankAccount('');
-                  }}
-                >
-                  Получить трейдом
-                </button>
-                <button
-                  type="button"
-                  id="deliveryBankBtn"
-                  className={`delivery-option ${deliveryMethod === 'bank' ? 'active' : ''}`}
-                  onClick={() => setDeliveryMethod('bank')}
-                >
-                  Получить банком
-                </button>
-              </div>
+              {isMarketDelivery ? (
+                <>
+                  <div className="delivery-toggle">
+                    <button type="button" className="delivery-option active">
+                      Через рынок (продажа скина)
+                    </button>
+                  </div>
+                  <div id="deliveryHint" className="delivery-hint">
+                    Голда в Standoff 2 выдаётся через Торговую площадку. После оплаты вы выставляете в лобби любой скин на продажу за сумму заказа (минимальная цена лота — 0.03 голды), а продавец выкупает его. Голда поступит на ваш аккаунт за вычетом комиссии рынка.
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="delivery-toggle">
+                    <button
+                      type="button"
+                      id="deliveryTradeBtn"
+                      className={`delivery-option ${deliveryMethod === 'trade' ? 'active' : ''}`}
+                      onClick={() => {
+                        setDeliveryMethod('trade');
+                        setBankAccount('');
+                      }}
+                    >
+                      Получить трейдом
+                    </button>
+                    <button
+                      type="button"
+                      id="deliveryBankBtn"
+                      className={`delivery-option ${deliveryMethod === 'bank' ? 'active' : ''}`}
+                      onClick={() => setDeliveryMethod('bank')}
+                    >
+                      Получить банком
+                    </button>
+                  </div>
 
-              <input
-                id="bankAccount"
-                className={`field delivery-extra ${deliveryMethod === 'bank' ? 'show' : ''}`}
-                type="text"
-                inputMode="numeric"
-                placeholder="Номер банковского счёта"
-                value={bankAccount}
-                onChange={(e) => setBankAccount(e.target.value.replace(/[^\d]/g, ''))}
-                enterKeyHint="done"
-                autoComplete="off"
-              />
+                  <input
+                    id="bankAccount"
+                    className={`field delivery-extra ${deliveryMethod === 'bank' ? 'show' : ''}`}
+                    type="text"
+                    inputMode="numeric"
+                    placeholder="Номер банковского счёта"
+                    value={bankAccount}
+                    onChange={(e) => setBankAccount(e.target.value.replace(/[^\d]/g, ''))}
+                    enterKeyHint="done"
+                    autoComplete="off"
+                  />
 
-              <div id="deliveryHint" className="delivery-hint">
-                {deliveryMethod === 'bank'
-                  ? 'Для выдачи банком укажи номер игрового банковского счёта.'
-                  : 'Выдача будет отмечена как трейд.'}
-              </div>
+                  <div id="deliveryHint" className="delivery-hint">
+                    {deliveryMethod === 'bank'
+                      ? 'Для выдачи банком укажи номер игрового банковского счёта.'
+                      : 'Выдача будет отмечена как трейд.'}
+                  </div>
+                </>
+              )}
             </div>
 
             <input
